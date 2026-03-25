@@ -165,3 +165,4 @@ If you discover a security vulnerability in KeySentry itself, please report it r
 ---
 
 **KeySentry** - Protecting your API infrastructure, one scan at a time.
+Note: Unlike some naive Python scanners that might accidentally execute the payload (as pointed out by security experts in Issue #24512), KeySentry uses strict static text analysis (Regex) and will NEVER execute the suspicious .pth or .py files. It is completely safe to run in compromised environments."
