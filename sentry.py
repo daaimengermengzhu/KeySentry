@@ -28,7 +28,7 @@ from pathlib import Path
 
 # 需要扫描的文件扩展名列表
 # 包含常见的代码文件和配置文件
-TARGET_EXTENSIONS = {'.py', '.js', '.ts', '.env', '.json', '.yaml', '.yml', '.toml', '.cfg', '.ini', '.conf'}
+TARGET_EXTENSIONS = {'.py', '.js', '.ts', '.env', '.json', '.yaml', '.yml', '.toml', '.cfg', '.ini', '.conf', '.pth'}
 
 # 平台密钥特征识别规则
 # 用于判断泄露的密钥属于哪家平台
@@ -80,6 +80,42 @@ IGNORE_DIRS = {
     '.vscode',           # VS Code 配置
 }
 
+# ============================================================================
+# 供应链攻击检测规则
+# 针对 LiteLLM 等 AI 基础设施供应链漏洞的检测
+# ============================================================================
+
+# 可疑的 .pth 文件名（供应链攻击常见载体）
+SUSPICIOUS_PTH_FILES = {
+    'litellm_init.pth',   # LiteLLM 相关的可疑 .pth 文件
+}
+
+# 供应链攻击特征：环境变量窃取 + 网络外发组合
+SUPPLY_CHAIN_ATTACK_PATTERN = re.compile(
+    r'os\.environ|'                           # 访问环境变量
+    r'os\.getenv|'                            # 获取环境变量
+    r'requests\.post|'                        # 网络外发 POST
+    r'requests\.get|'                         # 网络外发 GET
+    r'urllib\.request|'                       # URL 请求
+    r'http\.client|'                          # HTTP 客户端
+    r'socket\.connect',                       # Socket 连接
+    re.IGNORECASE
+)
+
+# 危险的网络外发目标模式（不明 IP 或可疑域名）
+SUSPICIOUS_NETWORK_PATTERN = re.compile(
+    r'https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # 直接 IP 地址
+    r'https?://[a-z0-9.-]+\.tk/|'                      # .tk 域名
+    r'https?://[a-z0-9.-]+\.ml/|'                      # .ml 域名
+    r'https?://[a-z0-9.-]+\.ga/|'                      # .ga 域名
+    r'https?://[a-z0-9.-]+\.cf/|'                      # .cf 域名
+    r'https?://[a-z0-9.-]+\.gq/|'                      # .gq 域名
+    r'pastebin\.com|'                                  # Pastebin
+    r'telegram\.org|'                                  # Telegram
+    r'discord\.com/api/webhooks',                      # Discord Webhook
+    re.IGNORECASE
+)
+
 
 # ============================================================================
 # 第二部分：扫描引擎
@@ -94,7 +130,8 @@ class SentryScanner:
     1. 递归遍历目录，找到所有目标文件
     2. 逐行扫描文件内容，匹配API密钥
     3. 检查 .gitignore 是否保护了 .env 文件
-    4. 生成可视化安全报告
+    4. 检测供应链攻击特征（LiteLLM 类漏洞）
+    5. 生成可视化安全报告
     """
     
     def __init__(self, target_dir='.'):
@@ -109,7 +146,8 @@ class SentryScanner:
         
         # 扫描结果统计
         self.scanned_files_count = 0  # 已扫描的文件数量
-        self.found_risks = []         # 发现的风险列表
+        self.found_risks = []         # 发现的 API Key 泄露风险列表
+        self.supply_chain_risks = []  # 发现的供应链攻击风险列表
         
         # 工程红线检查结果
         self.gitignore_exists = False    # .gitignore 是否存在
@@ -207,7 +245,7 @@ class SentryScanner:
     
     def _scan_file(self, file_path):
         """
-        扫描单个文件中的API密钥
+        扫描单个文件中的API密钥和供应链攻击特征
         
         参数:
             file_path: 要扫描的文件路径
@@ -215,11 +253,27 @@ class SentryScanner:
         # 更新扫描计数
         self.scanned_files_count += 1
         
+        # 获取文件名和扩展名
+        file_name = os.path.basename(file_path)
+        _, ext = os.path.splitext(file_name)
+        
+        # 检查是否是可疑的 .pth 文件
+        if ext.lower() == '.pth':
+            self._scan_pth_file(file_path, file_name)
+            return
+        
         try:
             # 读取文件内容
             # 使用 utf-8 编码，ignore 参数可以跳过无法解码的字符
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
+            
+            # 用于供应链攻击检测的变量
+            has_env_access = False
+            has_network_send = False
+            suspicious_network_target = None
+            env_access_line = None
+            network_send_line = None
             
             # 逐行扫描
             for line_num, line in enumerate(lines, start=1):
@@ -243,9 +297,79 @@ class SentryScanner:
                             'line': line_num,
                             'key': key
                         })
+                
+                # 供应链攻击特征检测
+                if ext.lower() == '.py':
+                    # 检查环境变量访问
+                    if re.search(r'os\.environ|os\.getenv', line, re.IGNORECASE):
+                        has_env_access = True
+                        env_access_line = line_num
+                    
+                    # 检查网络外发
+                    if re.search(r'requests\.post|requests\.get|urllib\.request|http\.client|socket\.connect', line, re.IGNORECASE):
+                        has_network_send = True
+                        network_send_line = line_num
+                    
+                    # 检查可疑的网络目标
+                    suspicious_match = SUSPICIOUS_NETWORK_PATTERN.search(line)
+                    if suspicious_match:
+                        suspicious_network_target = suspicious_match.group()
+            
+            # 如果同时存在环境变量访问和网络外发，标记为供应链攻击风险
+            if has_env_access and has_network_send:
+                self.supply_chain_risks.append({
+                    'file': file_path,
+                    'env_line': env_access_line,
+                    'network_line': network_send_line,
+                    'target': suspicious_network_target
+                })
                     
         except Exception:
             # 如果读取文件失败，跳过这个文件
+            pass
+    
+    def _scan_pth_file(self, file_path, file_name):
+        """
+        扫描 .pth 文件中的供应链攻击特征
+        
+        .pth 文件是 Python 的路径配置文件，可以被自动执行
+        供应链攻击经常利用这一点来注入恶意代码
+        
+        参数:
+            file_path: .pth 文件的完整路径
+            file_name: .pth 文件的文件名
+        """
+        # 检查是否是可疑的 .pth 文件名
+        if file_name.lower() in SUSPICIOUS_PTH_FILES:
+            self.supply_chain_risks.append({
+                'file': file_path,
+                'type': 'suspicious_pth',
+                'detail': f'发现可疑的 .pth 文件: {file_name}'
+            })
+        
+        # 检查是否在 site-packages 目录中（更危险）
+        if 'site-packages' in file_path.lower():
+            self.supply_chain_risks.append({
+                'file': file_path,
+                'type': 'site_packages_pth',
+                'detail': f'发现 site-packages 目录中的 .pth 文件: {file_name}'
+            })
+        
+        try:
+            # 读取 .pth 文件内容
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # 检查是否包含可疑的导入或执行代码
+            if re.search(r'import\s+os|exec\(|eval\(|__import__', content, re.IGNORECASE):
+                self.supply_chain_risks.append({
+                    'file': file_path,
+                    'type': 'malicious_pth_content',
+                    'detail': f'.pth 文件包含可疑的代码执行特征'
+                })
+                
+        except Exception:
+            # 如果读取文件失败，跳过
             pass
     
     def _mask_key(self, key):
@@ -326,6 +450,7 @@ class SentryScanner:
         # 检查是否有密钥泄露
         if self.found_risks:
             has_critical_issues = True
+            print("【 ⚠️ 敏感信息 】")
             print(f"  🆘 发现 {len(self.found_risks)} 处 API 密钥泄露！")
             print(f"  ⚠️  您的密钥可能已经被盗用，请立即处理！")
             print()
@@ -347,6 +472,41 @@ class SentryScanner:
                 print(f"     📄 文件: {rel_path}")
                 print(f"     📍 第 {risk['line']} 行")
                 print(f"     🔑 密钥: {masked_key}")
+                print()
+        
+        # 检查供应链攻击风险
+        if self.supply_chain_risks:
+            has_critical_issues = True
+            print("【 ☣️ 恶意组件 】")
+            print(f"  ☣️  检测到 {len(self.supply_chain_risks)} 处供应链攻击风险！")
+            print(f"  🚨 检测到疑似针对 AI 基础设施的供应链攻击特征，请立即物理隔离该开发环境！")
+            print()
+            
+            # 列出每一个供应链攻击风险
+            for i, risk in enumerate(self.supply_chain_risks, start=1):
+                rel_path = os.path.relpath(risk['file'], self.target_dir)
+                
+                print(f"  ☣️  供应链风险 #{i}")
+                print(f"     📄 文件: {rel_path}")
+                
+                # 根据风险类型显示不同的信息
+                if 'type' in risk:
+                    if risk['type'] == 'suspicious_pth':
+                        print(f"     🔍 风险类型: 可疑的 .pth 文件")
+                        print(f"     💀 细节: {risk.get('detail', '未知')}")
+                    elif risk['type'] == 'site_packages_pth':
+                        print(f"     🔍 风险类型: site-packages 中的 .pth 文件")
+                        print(f"     💀 细节: {risk.get('detail', '未知')}")
+                    elif risk['type'] == 'malicious_pth_content':
+                        print(f"     🔍 风险类型: .pth 文件包含恶意代码")
+                        print(f"     💀 细节: {risk.get('detail', '未知')}")
+                else:
+                    print(f"     🔍 风险类型: 环境变量窃取 + 网络外发组合")
+                    print(f"     💀 环境变量访问: 第 {risk.get('env_line', '未知')} 行")
+                    print(f"     💀 网络外发: 第 {risk.get('network_line', '未知')} 行")
+                    if risk.get('target'):
+                        print(f"     💀 可疑目标: {risk['target']}")
+                
                 print()
         
         # 检查工程红线问题
@@ -585,8 +745,45 @@ temp/
             print()
 
 
+# ============================================================================ 
+# 第三部分：供应链攻击检测规则
+# 针对 LiteLLM 等 AI 基础设施供应链漏洞的检测
 # ============================================================================
-# 第三部分：主程序入口
+
+# 可疑的 .pth 文件名（供应链攻击常见载体）
+SUSPICIOUS_PTH_FILES = {
+    'litellm_init.pth',   # LiteLLM 相关的可疑 .pth 文件
+}
+
+# 供应链攻击特征：环境变量窃取 + 网络外发组合
+SUPPLY_CHAIN_ATTACK_PATTERN = re.compile(
+    r'os\.environ|'                           # 访问环境变量
+    r'os\.getenv|'                            # 获取环境变量
+    r'requests\.post|'                        # 网络外发 POST
+    r'requests\.get|'                         # 网络外发 GET
+    r'urllib\.request|'                       # URL 请求
+    r'http\.client|'                          # HTTP 客户端
+    r'socket\.connect',                       # Socket 连接
+    re.IGNORECASE
+)
+
+# 危险的网络外发目标模式（不明 IP 或可疑域名）
+SUSPICIOUS_NETWORK_PATTERN = re.compile(
+    r'https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # 直接 IP 地址
+    r'https?://[a-z0-9.-]+\.tk/|'                      # .tk 域名
+    r'https?://[a-z0-9.-]+\.ml/|'                      # .ml 域名
+    r'https?://[a-z0-9.-]+\.ga/|'                      # .ga 域名
+    r'https?://[a-z0-9.-]+\.cf/|'                      # .cf 域名
+    r'https?://[a-z0-9.-]+\.gq/|'                      # .gq 域名
+    r'pastebin\.com|'                                  # Pastebin
+    r'telegram\.org|'                                  # Telegram
+    r'discord\.com/api/webhooks',                      # Discord Webhook
+    re.IGNORECASE
+)
+
+
+# ============================================================================ 
+# 第四部分：主程序入口
 # ============================================================================
 
 def main():
