@@ -1,0 +1,9 @@
+{
+  "OPENAI_API_KEY": "",
+  "OPENAI_BASE_PATH": "",
+  "model": "gpt-4o-mini",
+  "OCO_EMOJI": true,
+  "OCO_LANGUAGE": "zh-CN",
+  "OCO_MESSAGE_TEMPLATE_PLACEHOLDER": "$m",
+  "OCO_PROMPT_MODULE": "conventional-commit"
+}
